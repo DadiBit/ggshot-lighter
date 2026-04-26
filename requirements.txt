@@ -1,0 +1,6 @@
+telethon==1.41.2
+python-dotenv==1.0.1
+websockets==15.0.1
+
+# Official SDK pinned to stable tag
+git+https://github.com/elliottech/lighter-python.git
