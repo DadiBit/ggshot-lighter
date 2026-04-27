@@ -4,15 +4,41 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import math
+import re
 from typing import Any
 
 import lighter
+from lighter.signer_client import CreateOrderTxReq
 
 from .parser import Signal, pick_tp3_tp4
 
 
 def _norm_symbol(s: str) -> str:
     return "".join(ch for ch in s.upper() if ch.isalnum())
+
+
+def _extract_tx_hash(tx_response: Any) -> str | None:
+    """
+    Returns a compact tx hash from SDK response objects.
+    """
+    if tx_response is None:
+        return None
+
+    for field in ("tx_hash", "txHash"):
+        value = getattr(tx_response, field, None)
+        if value:
+            return str(value)
+
+    if isinstance(tx_response, dict):
+        for field in ("tx_hash", "txHash"):
+            value = tx_response.get(field)
+            if value:
+                return str(value)
+
+    match = re.search(r"tx_hash='([^']+)'", str(tx_response))
+    if match:
+        return match.group(1)
+    return str(tx_response)
 
 
 @dataclass(frozen=True)
@@ -178,8 +204,7 @@ class LighterExecutor:
         """
         Places:
         - entry limit order only when live market price is inside entry range
-        - 2 reduce-only TP limit orders (75% TP3, 25% TP4, with fallbacks)
-        - 1 reduce-only SL trigger order when possible
+        - grouped TP3/SL reduce-only exits linked to entry
         """
         assert self._signer is not None
 
@@ -235,16 +260,9 @@ class LighterExecutor:
 
         is_ask = signal.side.lower() == "short"
 
-        tp3, tp4 = pick_tp3_tp4(signal.tps)
+        tp3, _ = pick_tp3_tp4(signal.tps)
         tp3_int = int(round(tp3 * (10 ** market.supported_price_decimals)))
-        tp4_int = int(round(tp4 * (10 ** market.supported_price_decimals)))
         sl_int = int(round(signal.stop_loss * (10 ** market.supported_price_decimals)))
-
-        # Split sizes
-        tp3_size = int(math.floor(base_amount_int * 0.75))
-        tp4_size = base_amount_int - tp3_size
-        if tp3_size <= 0 or tp4_size <= 0:
-            return {"status": "skipped", "reason": "tp_split_too_small"}
 
         if dry_run:
             return {
@@ -263,98 +281,69 @@ class LighterExecutor:
                 "base_amount_int": base_amount_int,
                 "price_int": price_int,
                 "tp3": tp3,
-                "tp4": tp4,
                 "sl": signal.stop_loss,
             }
 
         applied_leverage = await self.ensure_leverage(market.market_id, requested_leverage)
 
-        # Entry order
+        # Grouped order:
+        # - Entry LIMIT IOC
+        # - TP3 TAKE_PROFIT_LIMIT
+        # - SL STOP_LOSS_LIMIT
+        # The grouped request lets Lighter manage trigger lifecycle server-side.
         api_key_index, nonce = self._signer.nonce_manager.next_nonce()
-        _, entry_hash, entry_err = await self._signer.create_order(
-            market_index=market.market_id,
-            client_order_index=int(nonce) % 2_000_000_000,
-            base_amount=base_amount_int,
-            price=price_int,
-            is_ask=is_ask,
-            order_type=self._signer.ORDER_TYPE_LIMIT,
-            time_in_force=self._signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-            reduce_only=False,
-            trigger_price=0,
+        entry_order = CreateOrderTxReq(
+            MarketIndex=market.market_id,
+            ClientOrderIndex=int(nonce) % 2_000_000_000,
+            BaseAmount=base_amount_int,
+            Price=price_int,
+            IsAsk=int(is_ask),
+            Type=self._signer.ORDER_TYPE_LIMIT,
+            TimeInForce=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+            ReduceOnly=0,
+            TriggerPrice=0,
+            OrderExpiry=0,
+        )
+
+        tp3_order = CreateOrderTxReq(
+            MarketIndex=market.market_id,
+            ClientOrderIndex=(int(nonce) + 1) % 2_000_000_000,
+            BaseAmount=0,  # auto-size to executed entry amount
+            Price=tp3_int,
+            IsAsk=int(not is_ask),
+            Type=self._signer.ORDER_TYPE_TAKE_PROFIT_LIMIT,
+            TimeInForce=self._signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+            ReduceOnly=1,
+            TriggerPrice=tp3_int,
+            OrderExpiry=-1,
+        )
+
+        sl_order = CreateOrderTxReq(
+            MarketIndex=market.market_id,
+            ClientOrderIndex=(int(nonce) + 2) % 2_000_000_000,
+            BaseAmount=0,  # auto-size to executed entry amount
+            Price=sl_int,
+            IsAsk=int(not is_ask),
+            Type=self._signer.ORDER_TYPE_STOP_LOSS_LIMIT,
+            TimeInForce=self._signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+            ReduceOnly=1,
+            TriggerPrice=sl_int,
+            OrderExpiry=-1,
+        )
+
+        _, grouped_hash, grouped_err = await self._signer.create_grouped_orders(
+            grouping_type=self._signer.GROUPING_TYPE_ONE_TRIGGERS_A_ONE_CANCELS_THE_OTHER,
+            orders=[entry_order, tp3_order, sl_order],
             nonce=nonce,
             api_key_index=api_key_index,
         )
-        if entry_err is not None:
-            raise RuntimeError(str(entry_err))
-
-        # Take profits (reduce-only, opposite side)
-        api_key_index, nonce = self._signer.nonce_manager.next_nonce(api_key_index)
-        _, tp3_hash, tp3_err = await self._signer.create_order(
-            market_index=market.market_id,
-            client_order_index=(int(nonce) % 2_000_000_000),
-            base_amount=tp3_size,
-            price=tp3_int,
-            is_ask=not is_ask,
-            order_type=self._signer.ORDER_TYPE_LIMIT,
-            time_in_force=self._signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-            reduce_only=True,
-            trigger_price=0,
-            nonce=nonce,
-            api_key_index=api_key_index,
-        )
-        if tp3_err is not None:
-            raise RuntimeError(str(tp3_err))
-
-        api_key_index, nonce = self._signer.nonce_manager.next_nonce(api_key_index)
-        _, tp4_hash, tp4_err = await self._signer.create_order(
-            market_index=market.market_id,
-            client_order_index=(int(nonce) % 2_000_000_000),
-            base_amount=tp4_size,
-            price=tp4_int,
-            is_ask=not is_ask,
-            order_type=self._signer.ORDER_TYPE_LIMIT,
-            time_in_force=self._signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-            reduce_only=True,
-            trigger_price=0,
-            nonce=nonce,
-            api_key_index=api_key_index,
-        )
-        if tp4_err is not None:
-            raise RuntimeError(str(tp4_err))
-
-        # Stop loss: best-effort. Some markets/accounts may not support trigger orders; if it errors,
-        # we surface it but keep entry/TPs.
-        sl_hash = None
-        sl_error = None
-        try:
-            api_key_index, nonce = self._signer.nonce_manager.next_nonce(api_key_index)
-            _, sl_hash, sl_err = await self._signer.create_order(
-                market_index=market.market_id,
-                client_order_index=(int(nonce) % 2_000_000_000),
-                base_amount=base_amount_int,
-                price=sl_int,
-                is_ask=not is_ask,  # close position
-                order_type=getattr(self._signer, "ORDER_TYPE_STOP_LOSS", self._signer.ORDER_TYPE_LIMIT),
-                time_in_force=self._signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                reduce_only=True,
-                trigger_price=sl_int,
-                nonce=nonce,
-                api_key_index=api_key_index,
-            )
-            if sl_err is not None:
-                sl_error = str(sl_err)
-        except Exception as e:
-            sl_error = str(e)
+        if grouped_err is not None:
+            raise RuntimeError(str(grouped_err))
 
         return {
             "status": "placed",
             "market": market.symbol,
             "market_id": market.market_id,
             "applied_leverage": applied_leverage,
-            "entry_tx_hash": str(entry_hash),
-            "tp3_tx_hash": str(tp3_hash),
-            "tp4_tx_hash": str(tp4_hash),
-            "sl_tx_hash": str(sl_hash) if sl_hash else None,
-            "sl_error": sl_error,
+            "grouped_tx_hash": _extract_tx_hash(grouped_hash),
         }
-

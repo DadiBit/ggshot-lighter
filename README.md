@@ -46,8 +46,8 @@ python -m ggshot_lighter_bot
 - **Symbol not on Lighter**: skipped (based on `/api/v1/orderBooks` metadata).
 - **Position size**: per signal notional is `available_balance * CAPITAL_ALLOCATION_PCT` (default 10%). If balance cannot be fetched, fallback to `TRADE_NOTIONAL_USD`.
 - **Take profit**:
-  - 75% at TP3, 25% at TP4
-  - If TP4 missing → use TP3; if TP3 missing → use TP2; if TP2 missing → use TP1
+  - 100% at TP3
+  - If TP3 missing → use TP2; if TP2 missing → use TP1
   - TP1 and TP2 are otherwise ignored
 
 ## Notes
