@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -64,11 +65,35 @@ async def main() -> None:
         except Exception:
             log.exception("Failed executing signal for %s", sig.symbol)
 
-    async with tg:
-        log.info("Listening to Telegram channel=%s (dry_run=%s)", cfg.telegram_channel, cfg.dry_run)
-        await tg.run_until_disconnected()
+    reconnect_delay_s = 5
+    max_reconnect_delay_s = 60
+    try:
+        async with tg:
+            while True:
+                log.info("Listening to Telegram channel=%s (dry_run=%s)", cfg.telegram_channel, cfg.dry_run)
+                try:
+                    await tg.run_until_disconnected()
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
+                    log.warning(
+                        "Telegram connection lost (%s). Retrying in %ss...",
+                        exc.__class__.__name__,
+                        reconnect_delay_s,
+                    )
+                except Exception:
+                    log.exception("Unexpected Telegram failure. Retrying in %ss...", reconnect_delay_s)
 
-    await exec_.close()
+                await asyncio.sleep(reconnect_delay_s)
+                reconnect_delay_s = min(max_reconnect_delay_s, reconnect_delay_s * 2)
+                with suppress(Exception):
+                    await tg.connect()
+    finally:
+        with suppress(Exception):
+            await tg.disconnect()
+        with suppress(Exception):
+            await exec_.close()
 
 
 if __name__ == "__main__":
