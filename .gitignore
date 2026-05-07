@@ -221,3 +221,4 @@ __marimo__/
 .env
 ggshot.session
 api_key_config.json
+ggshot.session-journal
